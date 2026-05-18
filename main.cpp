@@ -1,15 +1,30 @@
 #include <SDL2/SDL.h>
+#include <SDL2/SDL_ttf.h>
 #include <sndfile.h>
 #include <ebur128.h>
 #include <vector>
 #include <iostream>
 #include <cmath>
+#include <windows.h>
+#include <deque>
+#include <string>
+#include "Button.h"
+#include "drawText.h"
+
+std::deque<std::string> logLines;
+const int MAX_LOG_LINES = 20;
+bool displayDebugWindow = false;
+
 
 // =========================
 // AUDIO DATA
 // =========================
+const char* filepath = nullptr;
 std::vector<float> samples;
+int channels;
 int sampleRate = 0;
+SF_INFO info;
+float volume = 1.0;
 
 // Playback
 int playIndex = 0;
@@ -17,7 +32,17 @@ bool playing = false;
 
 // LUFS data
 std::vector<float> lufs;
+std::vector<float> lufsMomentary;
 std::vector<float> times;
+
+
+void logMessage(const std::string& msg)
+{
+    logLines.push_back(msg);
+
+    if (logLines.size() > MAX_LOG_LINES)
+        logLines.pop_front();
+}
 
 
 // HISTOGRAM
@@ -65,7 +90,6 @@ void fillHistogram()
 // =========================
 bool loadFile(const char* path)
 {
-    SF_INFO info;
     SNDFILE* file = sf_open(path, SFM_READ, &info);
 
     if (!file) return false;
@@ -77,13 +101,10 @@ bool loadFile(const char* path)
     sf_close(file);
 
     samples.resize(info.frames);
+    
+    samples = tmp;  // keep interleaved multichannel data
+    channels = info.channels;
 
-    for (int i = 0; i < info.frames; i++) {
-        float sum = 0;
-        for (int c = 0; c < info.channels; c++)
-            sum += tmp[i * info.channels + c];
-        samples[i] = sum / info.channels;
-    }
 
     return true;
 }
@@ -96,21 +117,123 @@ void computeLUFS()
     int window = sampleRate * 3;
     int hop = sampleRate / 2;
 
-    for (int i = 0; i + window < samples.size(); i += hop) {
+    ebur128_state* st = ebur128_init(
+        channels,
+        sampleRate,
+        EBUR128_MODE_S | EBUR128_MODE_I | EBUR128_MODE_M
+    );
 
-        ebur128_state* st = ebur128_init(1, sampleRate, EBUR128_MODE_S);
+    int totalFrames = info.frames;
+    int position = 0;
 
-        ebur128_add_frames_float(st, samples.data() + i, window);
+    while (position < totalFrames)
+    {
+        int framesToProcess = std::min(hop, totalFrames - position);
 
-        double val;
-        ebur128_loudness_shortterm(st, &val);
+        // feed chunk
+        ebur128_add_frames_float(
+            st,
+            samples.data() + position * channels,
+            framesToProcess
+        );
 
-        lufs.push_back(val);
-        times.push_back((float)i / sampleRate);
+        position += framesToProcess;
 
-        ebur128_destroy(&st);
+        // only start collecting after enough data
+        if (position >= window)
+        {
+            double val;
+            ebur128_loudness_shortterm(st, &val);
+
+            lufs.push_back(val);
+            times.push_back((float)position / sampleRate);
+            
+            double momentaryVal;
+            ebur128_loudness_momentary(st, &momentaryVal);
+            lufsMomentary.push_back(momentaryVal);
+        }
+    }
+
+    ebur128_destroy(&st);
+}
+
+
+void loadNewFile()
+{
+    char filename[MAX_PATH] = "";
+
+    OPENFILENAMEA ofn;
+    ZeroMemory(&ofn, sizeof(ofn));
+
+    ofn.lStructSize = sizeof(ofn);
+    ofn.lpstrFilter = "Audio Files\0*.wav;*.mp3\0All Files\0*.*\0";
+    ofn.lpstrFile = filename;
+    ofn.nMaxFile = MAX_PATH;
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+
+    if (GetOpenFileNameA(&ofn))
+    {
+        lufs.clear();
+        times.clear();
+        samples.clear();
+
+        if (!loadFile(filename))
+        {
+            logMessage("Failed to load file");
+            return;
+        }
+
+        computeLUFS();
+        fillHistogram();
+
+        playIndex = 0;
+        logMessage(std::string("Loaded: ") + filename);
     }
 }
+
+void reloadFile()
+{
+    lufs.clear();
+    times.clear();
+    samples.clear();
+
+    if (!loadFile(filepath))
+    {
+        logMessage("Failed to load file");
+        return;
+    }
+
+    computeLUFS();
+    fillHistogram();
+
+    playIndex = 0;
+    logMessage(std::string("Loaded: ") + filepath);
+}
+
+float dbToGain(float db)
+{
+    return powf(10.0f, db / 20.0f);
+}
+
+float volumeDB = -20.0f; // start at -12 dB
+float gain = dbToGain(volumeDB);
+
+void increaseVolume()
+{
+    volumeDB += 1.0f; // +1 dB
+    if (volumeDB > 0.0f) volumeDB = 0.0f;
+
+    gain = dbToGain(volumeDB);
+}
+
+void decreaseVolume()
+{
+    volumeDB -= 1.0f; // -1 dB
+    if (volumeDB < -60.0f) volumeDB = -60.0f;
+
+    gain = dbToGain(volumeDB);
+}
+
 
 // =========================
 // AUDIO CALLBACK (SDL)
@@ -122,19 +245,124 @@ void audioCallback(void* userdata, Uint8* stream, int len)
 
     for (int i = 0; i < count; i++) {
         if (playing && playIndex < samples.size()) {
-            out[i] = samples[playIndex++];
+            out[i] = samples[playIndex++] * gain;
         } else {
             out[i] = 0;
         }
     }
 }
 
+
+
+float getCurrentLUFS(float playPos)
+{
+    if (lufs.empty()) return -60.0f;
+
+    for (int i = 1; i < times.size(); i++)
+    {
+        if (times[i] >= playPos)
+            return lufs[i];
+    }
+
+    return lufs.back();
+}
+
+float getCurrentLUFSMomentary(float playPos)
+{
+    if (lufsMomentary.empty()) return -60.0f;
+
+    for (int i = 1; i < times.size(); i++)
+    {
+        if (times[i] >= playPos)
+            return lufsMomentary[i];
+    }
+
+    return lufsMomentary.back();
+}
+
+
+
+float computeRMS(int frameIndex, int windowFrames)
+{
+    if (samples.empty()) return 0.0f;
+
+    int start = frameIndex * channels;
+    int end = start + windowFrames * channels;
+
+    if (end > samples.size())
+        end = samples.size();
+
+    float sum = 0.0f;
+    int count = 0;
+
+    for (int i = start; i < end; i += channels)
+    {
+        float v = 0.0f;
+
+        // combine channels (energy-based)
+        for (int c = 0; c < channels; c++)
+        {
+            float s = samples[i + c];
+            v += s * s;
+        }
+
+        v /= channels;
+
+        sum += v;
+        count++;
+    }
+
+    if (count == 0) return 0.0f;
+
+    float rms = sqrtf(sum / count);
+
+    return rms;
+}
+
+float rmsToDb(float rms)
+{
+    if (rms <= 0.000001f)
+        return -60.0f;
+
+    return 20.0f * log10f(rms);
+}
+
+float getCurrentRMS(float playPos)
+{
+    int frameIndex = (int)(playPos * sampleRate);
+
+    int window = sampleRate * 0.05f; // 50 ms window (fast response)
+
+    float rms = computeRMS(frameIndex, window);
+
+    return rmsToDb(rms);
+}
+
+void renderRmsBar(SDL_Renderer* renderer, float rmsDB)
+{
+    if (rmsDB > 0) rmsDB = 0;
+    if (rmsDB < -60) rmsDB = -60;
+
+    int barHeight = (rmsDB + 60) * 5;
+
+    SDL_Rect fill = {
+        0,
+        500,
+        8,
+        -barHeight
+    };
+
+    SDL_SetRenderDrawColor(renderer, 0, 200, 255, 255);
+    SDL_RenderFillRect(renderer, &fill);
+}
+
+
 // =========================
 // MAIN
 // =========================
 int main(int argc, char** argv)
 {
-    const char* filepath = nullptr;
+    SetDllDirectory("dll");
 
     if (argc > 1) {
         filepath = argv[1];
@@ -150,6 +378,16 @@ int main(int argc, char** argv)
 
     std::cout << "Loaded: " << filepath << "\n";
 
+    TTF_Init();
+    TTF_Font* font_14 = TTF_OpenFont("C:/Windows/Fonts/consola.ttf", 14);
+    TTF_Font* font_12 = TTF_OpenFont("C:/Windows/Fonts/consola.ttf", 12);
+    TTF_Font* font_10 = TTF_OpenFont("C:/Windows/Fonts/consola.ttf", 10);
+
+    Button loadBtn(900, 560, 90, 24, 14, "LOAD FILE");
+    loadBtn.onClick = loadNewFile;
+
+    Button reloadBtn(900, 530, 80, 24, 14, "RELOAD");
+    reloadBtn.onClick = reloadFile;
 
     computeLUFS();
     fillHistogram();
@@ -160,7 +398,7 @@ int main(int argc, char** argv)
     SDL_AudioSpec spec{};
     spec.freq = sampleRate;
     spec.format = AUDIO_F32SYS;
-    spec.channels = 1;
+    spec.channels = channels;
     spec.samples = 1024;
     spec.callback = audioCallback;
 
@@ -193,18 +431,26 @@ int main(int argc, char** argv)
                 running = false;
 
             if (e.type == SDL_MOUSEBUTTONDOWN) {
-                int x = e.button.x;
-
-                float t = (float)x / 1000.0f;
-                playPos = t * times.back();
-
-                playIndex = playPos * sampleRate;
+                if (e.button.y < 500) {
+                    float t = (float)e.button.x / 1000.0f;
+                    playPos = t * times.back();
+                    playIndex = playPos * sampleRate * channels;
+                }
             }
 
             if (e.type == SDL_KEYDOWN) {
                 if (e.key.keysym.sym == SDLK_SPACE)
                     playing = !playing;
+                if (e.key.keysym.sym == SDLK_BACKQUOTE)
+                    displayDebugWindow = !displayDebugWindow;
+                if (e.key.keysym.sym == SDLK_UP)
+                    increaseVolume();
+                if (e.key.keysym.sym == SDLK_DOWN)
+                    decreaseVolume();
             }
+
+            loadBtn.handleEvent(e);
+            reloadBtn.handleEvent(e);
         }
 
         // ===== TIME UPDATE
@@ -226,7 +472,7 @@ int main(int argc, char** argv)
 
         // draw 
         int width = 1000;
-        int height = 300;
+        int height = 200;
         int centerY = height / 2;
         int samplesPerPixel = samples.size() / width;
 
@@ -255,63 +501,108 @@ int main(int argc, char** argv)
             SDL_RenderDrawLine(renderer, x, y1, x, y2);
         }
 
-        // HISTOGRAM
-        float cutoff = 0.02f;
-
-        for (int i = 1; i < bins-1; i++) {
-
-            float val = (histogram[i-1] + histogram[i] + histogram[i+1]) / 3.0f;
-
-            float norm = val / histogramMaxCount;
-
-            if (norm < cutoff)
-                continue;
-
-            norm = (norm - cutoff) / (1.0f - cutoff);
-            norm = sqrtf(norm);
-
-            Uint8 alpha = norm * 255;
-
-            float lufsVal = -60.0f + (float)i / (bins - 1) * 60.0f;
-            int y = 500 - (lufsVal + 60) * 5;
-
-            SDL_SetRenderDrawColor(renderer, 110, 60, 0, alpha);
-            SDL_RenderDrawLine(renderer, 0, y, 1000, y);
-        }
-
-
-
         // --- LUFS ---
 
-        SDL_SetRenderDrawColor(renderer, 100, 100, 100, 255);
-        SDL_RenderDrawLine(renderer, 0, 500, 1000, 500);
+        // LUFS GRID
+        for (int l = -60; l <= 0; l += 5)
+        {
+            int y = 500 - (l + 60) * 5;
 
-        SDL_SetRenderDrawColor(renderer, 255,80,80,255);
+            // Major lines every 10 LUFS
+            if (l % 10 == 0)
+                SDL_SetRenderDrawColor(renderer, 140, 140, 140, 255);
+            else
+                SDL_SetRenderDrawColor(renderer, 80, 80, 80, 255);
 
-        // int lufsMed = 0;
+            SDL_RenderDrawLine(renderer, 35, y, 1000, y);
 
-        for (int i = 1; i < lufs.size(); i++) {
-            // lufsMed = (lufsMed + lufs[i]) / 2;
-
-            int x1 = times[i-1]/times.back() * 1000;
-            int y1 = 500 - (lufs[i-1] + 60) * 5;
-
-            int x2 = times[i]/times.back() * 1000;
-            int y2 = 500 - (lufs[i] + 60) * 5;
-
-            SDL_RenderDrawLine(renderer, x1, y1, x2, y2);
+            if (l % 10 == 0)
+                drawText(renderer, font_12, std::to_string(l), 10, y - 6);
         }
 
+        // LUFS LINE
+        SDL_SetRenderDrawColor(renderer, 255,80,80,255);
+        for (int i = 1; i < lufs.size(); i++) {
+                // lufsMed = (lufsMed + lufs[i]) / 2;
+                int val1 = lufs[i-1];
+                int val2 = lufs[i];
 
-        // std::cout << lufsMed << std::endl;
-        // int lufsY = 500 - (lufsMed + 60) * 5;
-        // SDL_RenderDrawLine(renderer, 0, lufsY, 1000, lufsY);
+                if (val1 > 0 ) val1 = 0;
+                if (val1 < -60) val1 = -60;
+                if (val2 > 0 ) val2 = 0;
+                if (val2 < -60) val2 = -60;
+
+                int x1 = times[i-1]/times.back() * 1000;
+                int y1 = 500 - (val1 + 60) * 5;
+
+                int x2 = times[i]/times.back() * 1000;
+                int y2 = 500 - (val2 + 60) * 5;
+
+                SDL_RenderDrawLine(renderer, x1, y1, x2, y2);
+        }
+
+        // INSTANT LUFS text
+        float currentLufs = getCurrentLUFS(playPos);
+
+        drawText(
+            renderer,
+            font_14,
+            "LUFS: " + std::to_string((int)roundf(currentLufs)),
+            20, 535
+        );
+
+        // RMS BAR
+        float rms = getCurrentRMS(playPos);
+        renderRmsBar(renderer, rms);
+
+        drawText(
+            renderer,
+            font_14,
+            "RMS: " + std::to_string((int)roundf(rms)),
+            20, 555
+        );
+
+        drawText(
+            renderer,
+            font_12,
+            "[RMS]",
+            10, 510
+        );
+
+        if (playing) {
+            logMessage("LUFS: " + std::to_string(currentLufs) + " RMS: " + std::to_string(rms));
+        }
 
         // --- PLAYHEAD ---
         int px = playPos / times.back() * 1000;
-
         SDL_SetRenderDrawColor(renderer, 255,255,0,255);
-        SDL_RenderDrawLine(renderer, px, 0, px, 600);
+        SDL_RenderDrawLine(renderer, px, 0, px, 500);
+
+        // VOLUME
+        drawText(
+            renderer,
+            font_14,
+            "Gain: " + std::to_string(int(gain*100)) + "%",
+            20, 575
+        );
+
+        // LOG
+        if (displayDebugWindow)
+        {
+            SDL_SetRenderDrawColor(renderer, 0, 0, 0, 120);
+            SDL_Rect bg = {5, 5, 400, 300};
+            SDL_RenderFillRect(renderer, &bg);
+
+            int yOffset = 10;
+            for (const auto& line : logLines)
+            {
+                drawText(renderer, font_12, line, 10, yOffset);
+                yOffset += 14;
+            }
+        }
+
+        loadBtn.render(renderer);
+        reloadBtn.render(renderer);
 
         SDL_RenderPresent(renderer);
     }
