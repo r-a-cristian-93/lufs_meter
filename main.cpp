@@ -4,6 +4,7 @@
 #include <ebur128.h>
 #include <vector>
 #include <iostream>
+#include <sstream>
 #include <cmath>
 #include <windows.h>
 #include <deque>
@@ -15,6 +16,8 @@ std::deque<std::string> logLines;
 const int MAX_LOG_LINES = 20;
 bool displayDebugWindow = false;
 
+int windowWidth = 1024;
+int windowHeight = 600;
 
 // =========================
 // AUDIO DATA
@@ -29,11 +32,20 @@ float volume = 1.0;
 // Playback
 int playIndex = 0;
 bool playing = false;
+int sampleWindowOffsetX = 50;
+int sampleWindowWidth = 950;
+int sampleWindowHeight = 200;
 
 // LUFS data
 std::vector<float> lufs;
 std::vector<float> lufsMomentary;
 std::vector<float> times;
+
+// FPS
+float fps = 0.0f;
+Uint32 lastFPSTime = 0;
+int frameCount = 0;
+const float targetFrameTime = 1.0f / 60.0f; // ~0.01667 sec
 
 
 void logMessage(const std::string& msg)
@@ -101,10 +113,8 @@ bool loadFile(const char* path)
     sf_close(file);
 
     samples.resize(info.frames);
-    
     samples = tmp;  // keep interleaved multichannel data
     channels = info.channels;
-
 
     return true;
 }
@@ -160,6 +170,7 @@ void computeLUFS()
 
 void loadNewFile()
 {
+    playing = false;
     char filename[MAX_PATH] = "";
 
     OPENFILENAMEA ofn;
@@ -193,6 +204,7 @@ void loadNewFile()
 
 void reloadFile()
 {
+    playing = false;
     lufs.clear();
     times.clear();
     samples.clear();
@@ -346,7 +358,7 @@ void renderRmsBar(SDL_Renderer* renderer, float rmsDB)
     int barHeight = (rmsDB + 60) * 5;
 
     SDL_Rect fill = {
-        0,
+        5,
         500,
         8,
         -barHeight
@@ -410,7 +422,7 @@ int main(int argc, char** argv)
         "LUFS Meter",
         SDL_WINDOWPOS_CENTERED,
         SDL_WINDOWPOS_CENTERED,
-        1000, 600,
+        windowWidth, windowHeight,
         SDL_WINDOW_SHOWN
     );
 
@@ -423,6 +435,11 @@ int main(int argc, char** argv)
     float playPos = 0.0f;
 
     while (running) {
+        Uint32 frameStart = SDL_GetTicks();
+        Uint32 now = frameStart;
+        float dt = (now - lastTime) / 1000.0f;
+        lastTime = now;
+        frameCount++;
 
         SDL_Event e;
         while (SDL_PollEvent(&e)) {
@@ -432,7 +449,11 @@ int main(int argc, char** argv)
 
             if (e.type == SDL_MOUSEBUTTONDOWN) {
                 if (e.button.y < 500) {
-                    float t = (float)e.button.x / 1000.0f;
+                    float t = (float)(e.button.x - sampleWindowOffsetX) / sampleWindowWidth;
+
+                    if (t < 0.0f) t = 0.0f;
+                    if (t > 1.0f) t = 1.0f;
+
                     playPos = t * times.back();
                     playIndex = playPos * sampleRate * channels;
                 }
@@ -453,10 +474,12 @@ int main(int argc, char** argv)
             reloadBtn.handleEvent(e);
         }
 
-        // ===== TIME UPDATE
-        Uint32 now = SDL_GetTicks();
-        float dt = (now - lastTime) / 1000.0f;
-        lastTime = now;
+        if (now - lastFPSTime >= 1000) // every 1 second
+        {
+            fps = frameCount / ((now - lastFPSTime) / 1000.0f);
+            frameCount = 0;
+            lastFPSTime = now;
+        }
 
         if (playing)
             playPos += dt;
@@ -471,14 +494,12 @@ int main(int argc, char** argv)
         int N = samples.size();
 
         // draw 
-        int width = 1000;
-        int height = 200;
-        int centerY = height / 2;
-        int samplesPerPixel = samples.size() / width;
+        int centerY = sampleWindowHeight / 2;
+        int samplesPerPixel = samples.size() / sampleWindowWidth;
 
         SDL_SetRenderDrawColor(renderer, 0, 150, 255, 255);
 
-        for (int x = 0; x < width; x++) {
+        for (int x = 0; x < sampleWindowWidth; x++) {
 
             int start = x * samplesPerPixel;
             int end = start + samplesPerPixel;
@@ -494,11 +515,11 @@ int main(int argc, char** argv)
                 if (v > maxVal) maxVal = v;
             }
 
-            float scale = height / 2.2f;
+            float scale = sampleWindowHeight / 2.2f;
             int y1 = centerY + (int)(minVal * scale);
             int y2 = centerY + (int)(maxVal * scale);
 
-            SDL_RenderDrawLine(renderer, x, y1, x, y2);
+            SDL_RenderDrawLine(renderer, x + sampleWindowOffsetX, y1, x + sampleWindowOffsetX, y2);
         }
 
         // --- LUFS ---
@@ -510,18 +531,17 @@ int main(int argc, char** argv)
 
             // Major lines every 10 LUFS
             if (l % 10 == 0)
-                SDL_SetRenderDrawColor(renderer, 140, 140, 140, 255);
+                SDL_SetRenderDrawColor(renderer, 140, 140, 140, 100);
             else
-                SDL_SetRenderDrawColor(renderer, 80, 80, 80, 255);
+                SDL_SetRenderDrawColor(renderer, 80, 80, 80, 100);
 
-            SDL_RenderDrawLine(renderer, 35, y, 1000, y);
+            SDL_RenderDrawLine(renderer, sampleWindowOffsetX, y, sampleWindowWidth + sampleWindowOffsetX, y);
 
             if (l % 10 == 0)
-                drawText(renderer, font_12, std::to_string(l), 10, y - 6);
+                drawText(renderer, font_12, std::to_string(l), 20, y - 6);
         }
 
         // LUFS LINE
-        SDL_SetRenderDrawColor(renderer, 255,80,80,255);
         for (int i = 1; i < lufs.size(); i++) {
                 // lufsMed = (lufsMed + lufs[i]) / 2;
                 int val1 = lufs[i-1];
@@ -532,13 +552,18 @@ int main(int argc, char** argv)
                 if (val2 > 0 ) val2 = 0;
                 if (val2 < -60) val2 = -60;
 
-                int x1 = times[i-1]/times.back() * 1000;
+                int x1 = times[i-1]/times.back() * sampleWindowWidth + sampleWindowOffsetX;
                 int y1 = 500 - (val1 + 60) * 5;
 
-                int x2 = times[i]/times.back() * 1000;
+                int x2 = times[i]/times.back() * sampleWindowWidth + sampleWindowOffsetX;
                 int y2 = 500 - (val2 + 60) * 5;
 
+                SDL_SetRenderDrawColor(renderer, 255,80,80,255);
                 SDL_RenderDrawLine(renderer, x1, y1, x2, y2);
+
+                SDL_SetRenderDrawColor(renderer, 255,80,80,180);
+                SDL_RenderDrawLine(renderer, x1+1, y1, x2, y2+1);
+                SDL_RenderDrawLine(renderer, x1, y1+1, x2, y2+1);
         }
 
         // INSTANT LUFS text
@@ -574,7 +599,7 @@ int main(int argc, char** argv)
         }
 
         // --- PLAYHEAD ---
-        int px = playPos / times.back() * 1000;
+        int px = playPos / times.back() * sampleWindowWidth + sampleWindowOffsetX;
         SDL_SetRenderDrawColor(renderer, 255,255,0,255);
         SDL_RenderDrawLine(renderer, px, 0, px, 500);
 
@@ -599,12 +624,25 @@ int main(int argc, char** argv)
                 drawText(renderer, font_12, line, 10, yOffset);
                 yOffset += 14;
             }
+
+            std::stringstream ss;
+            ss << "FPS: " << (int)fps;
+            drawText(renderer, font_12, ss.str(), 10, 290);
         }
 
         loadBtn.render(renderer);
         reloadBtn.render(renderer);
 
         SDL_RenderPresent(renderer);
+             
+        // ===== FPS CAP =====
+        Uint32 frameEnd = SDL_GetTicks();
+        float frameTime = (frameEnd - frameStart) / 1000.0f;
+        if (frameTime < targetFrameTime)
+        {
+            Uint32 delay = (Uint32)((targetFrameTime - frameTime) * 1000.0f);
+            SDL_Delay(delay);
+        }
     }
 
     SDL_CloseAudio();
