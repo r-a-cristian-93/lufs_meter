@@ -12,6 +12,7 @@
 #include <string>
 #include "Button.h"
 #include "drawText.h"
+#include "Slider.h"
 
 std::deque<std::string> logLines;
 const int MAX_LOG_LINES = 20;
@@ -213,25 +214,7 @@ float dbToGain(float db)
     return powf(10.0f, db / 20.0f);
 }
 
-float volumeDB = -20.0f; // start at -12 dB
-float gain = dbToGain(volumeDB);
-
-void increaseVolume()
-{
-    volumeDB += 1.0f; // +1 dB
-    if (volumeDB > 0.0f) volumeDB = 0.0f;
-
-    gain = dbToGain(volumeDB);
-}
-
-void decreaseVolume()
-{
-    volumeDB -= 1.0f; // -1 dB
-    if (volumeDB < minLUFS) volumeDB = minLUFS;
-
-    gain = dbToGain(volumeDB);
-}
-
+float gain = 0.21f;
 
 // =========================
 // AUDIO CALLBACK (SDL)
@@ -389,6 +372,7 @@ float rmsPeakDisplay = minLUFS;
 
 void renderRmsBar(SDL_Renderer* renderer, float rmsDB)
 {
+    if (!playing) rmsDB = minLUFS;
     if (rmsDB > maxLUFS) rmsDB = maxLUFS;
     if (rmsDB < minLUFS) rmsDB = minLUFS;
 
@@ -398,20 +382,48 @@ void renderRmsBar(SDL_Renderer* renderer, float rmsDB)
 
     int totalHeight = lufsDelta * lufsToPxScale;
 
-    // draw full bar range (-60 → 0)
+    // =========================
+    // PEAK HOLD STATE
+    // =========================
+    static float rmsPeakDisplay = minLUFS;
+    static int holdCounter = 0;
+
+    const int holdFrames = 5;
+    const float releaseSpeed = 0.05f;
+
+    // update peak
+    if (rmsDB > rmsPeakDisplay)
+    {
+        rmsPeakDisplay = rmsDB;
+        holdCounter = holdFrames;
+    }
+    else
+    {
+        if (holdCounter > 0)
+        {
+            holdCounter--;
+        }
+        else
+        {
+            // smooth decay
+            rmsPeakDisplay += (rmsDB - rmsPeakDisplay) * releaseSpeed;
+        }
+    }
+
+    // =========================
+    // BAR RENDER
+    // =========================
+    int currentHeight = (rmsDB + lufsDelta) * lufsToPxScale;
+
     for (int i = 0; i < totalHeight; i++)
     {
-        // convert pixel → dB value
         float db = minLUFS + (float)i / totalHeight * (maxLUFS - minLUFS);
-
-        // normalize for color (0..1)
         float t = (db - minLUFS) / (maxLUFS - minLUFS);
 
         Uint8 r, g, b;
 
         if (t < 0.5f)
         {
-            // green → yellow
             float k = t / 0.5f;
             r = (Uint8)(k * 255);
             g = 255;
@@ -419,7 +431,6 @@ void renderRmsBar(SDL_Renderer* renderer, float rmsDB)
         }
         else
         {
-            // yellow → red
             float k = (t - 0.5f) / 0.5f;
             r = 255;
             g = (Uint8)((1.0f - k) * 255);
@@ -428,21 +439,21 @@ void renderRmsBar(SDL_Renderer* renderer, float rmsDB)
 
         int y = baseY - i;
 
-        // ✅ only fill UP TO current RMS level
-        int currentHeight = (rmsDB + lufsDelta) * lufsToPxScale;
-
         if (i <= currentHeight)
-        {
             SDL_SetRenderDrawColor(renderer, r, g, b, 255);
-        }
         else
-        {
-            // background (inactive part)
             SDL_SetRenderDrawColor(renderer, 40, 40, 40, 255);
-        }
 
         SDL_RenderDrawLine(renderer, barX, y, barX + barWidth, y);
     }
+
+    // =========================
+    // PEAK LINE DRAW
+    // =========================
+    int peakY = baseY - (rmsPeakDisplay + lufsDelta) * lufsToPxScale;
+
+    SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255);
+    SDL_RenderDrawLine(renderer, barX - 1, peakY, barX + barWidth + 1, peakY);
 }
 
 
@@ -576,6 +587,13 @@ int main(int argc, char** argv)
     Button reloadBtn(900, 530, 80, 24, 14, "RELOAD");
     reloadBtn.onClick = reloadFile;
 
+    Slider gainSlider(200, 580, 130, 4, gain);
+    gainSlider.onChange = [](float v)
+    {
+        gain = v;
+    };
+
+
     SDL_Init(SDL_INIT_AUDIO | SDL_INIT_VIDEO);
 
     // Audio setup
@@ -635,10 +653,6 @@ int main(int argc, char** argv)
                     playing = !playing;
                 if (e.key.keysym.sym == SDLK_BACKQUOTE)
                     displayDebugWindow = !displayDebugWindow;
-                if (e.key.keysym.sym == SDLK_UP)
-                    increaseVolume();
-                if (e.key.keysym.sym == SDLK_DOWN)
-                    decreaseVolume();
             }
 
             // ZOOM
@@ -689,6 +703,7 @@ int main(int argc, char** argv)
 
             loadBtn.handleEvent(e);
             reloadBtn.handleEvent(e);
+            gainSlider.handleEvent(e);
         }
 
         if (now - lastFPSTime >= 1000) // every 1 second
@@ -859,13 +874,11 @@ int main(int argc, char** argv)
 
         // --- PLAYHEAD ---
         int px = (playPos - viewStart) / viewWidth * sampleWindowWidth + sampleWindowOffsetX;
-        SDL_SetRenderDrawColor(renderer, 255,255,0,255);
-        SDL_RenderDrawLine(renderer, px, 0, px, 500);
+        SDL_SetRenderDrawColor(renderer, 255,255,0,180);
+        SDL_RenderDrawLine(renderer, px, 0, px, 210);
+        SDL_RenderDrawLine(renderer, px, 240, px, 500);
 
         // TIMELINE
-        int timelineY = 240;
-        SDL_SetRenderDrawColor(renderer, 255, 255, 0, 180);
-        SDL_RenderDrawLine(renderer, px, timelineY, px, timelineY + 12);
         renderTimeline(renderer, font_12);
 
         // TIME
@@ -874,14 +887,14 @@ int main(int argc, char** argv)
             renderer, 
             font_14, 
             "Time: " + formatTimeMs(timeAtCursor), 
-            200, 535);
+            20, 575);
 
         // GAIN
         drawText(
             renderer,
             font_14,
-            "Gain: " + std::to_string(int(gain*100)) + "%",
-            20, 575
+            "Output gain: " + std::to_string(int(gain*100)) + "%",
+            200, 555
         );
 
         // LOG
@@ -905,6 +918,7 @@ int main(int argc, char** argv)
 
         loadBtn.render(renderer);
         reloadBtn.render(renderer);
+        gainSlider.render(renderer);
 
         SDL_RenderPresent(renderer);
              
