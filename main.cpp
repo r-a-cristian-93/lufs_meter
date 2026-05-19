@@ -41,6 +41,18 @@ std::vector<float> lufs;
 std::vector<float> lufsMomentary;
 std::vector<float> times;
 
+// use SAME mapping as LUFS graph
+float minLUFS = -60.0f;
+float maxLUFS = 0.0f;
+int lufsToPxScale = 4;
+int lufsDelta = 60;
+// Lufs: -60 to 0
+// Delta Lufs: 60
+// Scale: 4
+// Graph height: Delta Lufs / Scale = 60 * 4 = 240px
+int lufsGraphStartY = 500;
+
+
 // FPS
 float fps = 0.0f;
 Uint32 lastFPSTime = 0;
@@ -71,10 +83,6 @@ void fillHistogram()
     std::fill(histogram.begin(), histogram.end(), 0);
 
     histogramMaxCount = 1;
-
-    // use SAME mapping as your LUFS graph
-    float minLUFS = -60.0f;
-    float maxLUFS = 0.0f;
 
     for (float v : lufs) {
 
@@ -241,7 +249,7 @@ void increaseVolume()
 void decreaseVolume()
 {
     volumeDB -= 1.0f; // -1 dB
-    if (volumeDB < -60.0f) volumeDB = -60.0f;
+    if (volumeDB < minLUFS) volumeDB = minLUFS;
 
     gain = dbToGain(volumeDB);
 }
@@ -268,7 +276,7 @@ void audioCallback(void* userdata, Uint8* stream, int len)
 
 float getCurrentLUFS(float playPos)
 {
-    if (lufs.empty()) return -60.0f;
+    if (lufs.empty()) return minLUFS;
 
     for (int i = 1; i < times.size(); i++)
     {
@@ -281,7 +289,7 @@ float getCurrentLUFS(float playPos)
 
 float getCurrentLUFSMomentary(float playPos)
 {
-    if (lufsMomentary.empty()) return -60.0f;
+    if (lufsMomentary.empty()) return minLUFS;
 
     for (int i = 1; i < times.size(); i++)
     {
@@ -334,7 +342,7 @@ float computeRMS(int frameIndex, int windowFrames)
 float rmsToDb(float rms)
 {
     if (rms <= 0.000001f)
-        return -60.0f;
+        return minLUFS;
 
     return 20.0f * log10f(rms);
 }
@@ -342,20 +350,43 @@ float rmsToDb(float rms)
 float getCurrentRMS(float playPos)
 {
     int frameIndex = (int)(playPos * sampleRate);
-
     int window = sampleRate * 0.05f; // 50 ms window (fast response)
-
     float rms = computeRMS(frameIndex, window);
 
     return rmsToDb(rms);
 }
 
+float getTimeAtCursor(int mouseX)
+{
+    float t = (float)(mouseX - sampleWindowOffsetX) / sampleWindowWidth;
+
+    if (t < 0.0f) t = 0.0f;
+    if (t > 1.0f) t = 1.0f;
+
+    return t * times.back();
+}
+
+std::string formatTime(float seconds)
+{
+    int total = (int)seconds;
+    int minutes = total / 60;
+    int secs = total % 60;
+
+    std::stringstream ss;
+    if (secs < 10)
+        ss << minutes << ":0" << secs;
+    else
+        ss << minutes << ":" << secs;
+
+    return ss.str();
+}
+
 void renderRmsBar(SDL_Renderer* renderer, float rmsDB)
 {
-    if (rmsDB > 0) rmsDB = 0;
-    if (rmsDB < -60) rmsDB = -60;
+    if (rmsDB > maxLUFS) rmsDB = maxLUFS;
+    if (rmsDB < minLUFS) rmsDB = minLUFS;
 
-    int barHeight = (rmsDB + 60) * 5;
+    int barHeight = (rmsDB + lufsDelta) * lufsToPxScale;
 
     SDL_Rect fill = {
         5,
@@ -525,9 +556,9 @@ int main(int argc, char** argv)
         // --- LUFS ---
 
         // LUFS GRID
-        for (int l = -60; l <= 0; l += 5)
+        for (int l = minLUFS; l <= maxLUFS; l += 5)
         {
-            int y = 500 - (l + 60) * 5;
+            int y = lufsGraphStartY - (l + lufsDelta) * lufsToPxScale;
 
             // Major lines every 10 LUFS
             if (l % 10 == 0)
@@ -543,27 +574,27 @@ int main(int argc, char** argv)
 
         // LUFS LINE
         for (int i = 1; i < lufs.size(); i++) {
-                // lufsMed = (lufsMed + lufs[i]) / 2;
-                int val1 = lufs[i-1];
-                int val2 = lufs[i];
+            // lufsMed = (lufsMed + lufs[i]) / 2;
+            int val1 = lufs[i-1];
+            int val2 = lufs[i];
 
-                if (val1 > 0 ) val1 = 0;
-                if (val1 < -60) val1 = -60;
-                if (val2 > 0 ) val2 = 0;
-                if (val2 < -60) val2 = -60;
+            if (val1 > maxLUFS ) val1 = maxLUFS;
+            if (val1 < minLUFS) val1 = minLUFS;
+            if (val2 > maxLUFS ) val2 = maxLUFS;
+            if (val2 < minLUFS) val2 = minLUFS;
 
-                int x1 = times[i-1]/times.back() * sampleWindowWidth + sampleWindowOffsetX;
-                int y1 = 500 - (val1 + 60) * 5;
+            int x1 = times[i-1]/times.back() * sampleWindowWidth + sampleWindowOffsetX;
+            int y1 = lufsGraphStartY - (val1 + lufsDelta) * lufsToPxScale;
 
-                int x2 = times[i]/times.back() * sampleWindowWidth + sampleWindowOffsetX;
-                int y2 = 500 - (val2 + 60) * 5;
+            int x2 = times[i]/times.back() * sampleWindowWidth + sampleWindowOffsetX;
+            int y2 = lufsGraphStartY - (val2 + lufsDelta) * lufsToPxScale;
 
-                SDL_SetRenderDrawColor(renderer, 255,80,80,255);
-                SDL_RenderDrawLine(renderer, x1, y1, x2, y2);
+            SDL_SetRenderDrawColor(renderer, 255,80,80,255);
+            SDL_RenderDrawLine(renderer, x1, y1, x2, y2);
 
-                SDL_SetRenderDrawColor(renderer, 255,80,80,180);
-                SDL_RenderDrawLine(renderer, x1+1, y1, x2, y2+1);
-                SDL_RenderDrawLine(renderer, x1, y1+1, x2, y2+1);
+            SDL_SetRenderDrawColor(renderer, 255,80,80,180);
+            SDL_RenderDrawLine(renderer, x1+1, y1, x2, y2+1);
+            SDL_RenderDrawLine(renderer, x1, y1+1, x2, y2+1);
         }
 
         // INSTANT LUFS text
@@ -603,7 +634,15 @@ int main(int argc, char** argv)
         SDL_SetRenderDrawColor(renderer, 255,255,0,255);
         SDL_RenderDrawLine(renderer, px, 0, px, 500);
 
-        // VOLUME
+        // TIME
+        float timeAtCursor = getTimeAtCursor(px);
+        drawText(
+            renderer, 
+            font_14, 
+            "Time: " + formatTime(timeAtCursor), 
+            200, 535);
+
+        // GAIN
         drawText(
             renderer,
             font_14,
