@@ -5,6 +5,7 @@
 #include <vector>
 #include <iostream>
 #include <sstream>
+#include <iomanip>
 #include <cmath>
 #include <windows.h>
 #include <deque>
@@ -19,10 +20,14 @@ bool displayDebugWindow = false;
 int windowWidth = 1024;
 int windowHeight = 600;
 
+float viewStart = 0.0f;              // seconds
+float viewWidth = 10.0f;             // visible duration in seconds
+
+
 // =========================
 // AUDIO DATA
 // =========================
-const char* filepath = nullptr;
+std::string filepath;
 std::vector<float> samples;
 int channels;
 int sampleRate = 0;
@@ -30,6 +35,7 @@ SF_INFO info;
 float volume = 1.0;
 
 // Playback
+float playPos = 0.0f;
 int playIndex = 0;
 bool playing = false;
 int sampleWindowOffsetX = 50;
@@ -67,43 +73,6 @@ void logMessage(const std::string& msg)
     if (logLines.size() > MAX_LOG_LINES)
         logLines.pop_front();
 }
-
-
-// HISTOGRAM
-
-// --- histogram setup ---
-const int bins = 300;
-
-std::vector<int> histogram(bins, 0);
-int histogramMaxCount = 0;
-
-void fillHistogram()
-{
-    // reset
-    std::fill(histogram.begin(), histogram.end(), 0);
-
-    histogramMaxCount = 1;
-
-    for (float v : lufs) {
-
-        if (!std::isfinite(v)) continue;
-
-        // clamp to visible range
-        if (v < minLUFS) v = minLUFS;
-        if (v > maxLUFS) v = maxLUFS;
-
-        // map LUFS -> bin index
-        float norm = (v - minLUFS) / (maxLUFS - minLUFS);
-        int idx = (int)(norm * (bins - 1));
-
-        if (idx >= 0 && idx < bins) {
-            histogram[idx]++;
-            if (histogram[idx] > histogramMaxCount)
-                histogramMaxCount = histogram[idx];
-        }
-    }
-}
-
 
 // =========================
 // LOAD AUDIO
@@ -170,7 +139,7 @@ void computeLUFS()
             ebur128_loudness_momentary(st, &momentaryVal);
             lufsMomentary.push_back(momentaryVal);
         }
-    }
+    }    
 
     ebur128_destroy(&st);
 }
@@ -179,14 +148,16 @@ void computeLUFS()
 void loadNewFile()
 {
     playing = false;
-    char filename[MAX_PATH] = "";
+    playPos = 0.0f;
+    playIndex = 0;
+    char newFilePath[MAX_PATH] = "";
 
     OPENFILENAMEA ofn;
     ZeroMemory(&ofn, sizeof(ofn));
 
     ofn.lStructSize = sizeof(ofn);
     ofn.lpstrFilter = "Audio Files\0*.wav;*.mp3\0All Files\0*.*\0";
-    ofn.lpstrFile = filename;
+    ofn.lpstrFile = newFilePath;
     ofn.nMaxFile = MAX_PATH;
     ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
 
@@ -194,39 +165,46 @@ void loadNewFile()
     {
         lufs.clear();
         times.clear();
-        samples.clear();
+        samples.clear();        
 
-        if (!loadFile(filename))
+        if (!loadFile(newFilePath))
         {
-            logMessage("Failed to load file");
+            logMessage(std::string("Failed to load file ") + newFilePath);
             return;
         }
 
-        computeLUFS();
-        fillHistogram();
+        filepath = newFilePath;
 
-        playIndex = 0;
-        logMessage(std::string("Loaded: ") + filename);
+        computeLUFS();
+        
+        viewStart = 0.0f;
+        viewWidth = times.back();
+
+        logMessage(std::string("Loaded: ") + filepath);
     }
 }
 
 void reloadFile()
 {
     playing = false;
+    playPos = 0.0f;
+    playIndex = 0;
+
     lufs.clear();
     times.clear();
     samples.clear();
 
-    if (!loadFile(filepath))
+    if (!loadFile(filepath.c_str()))
     {
-        logMessage("Failed to load file");
+        logMessage(std::string("Failed to load file") + filepath);
         return;
     }
 
     computeLUFS();
-    fillHistogram();
 
-    playIndex = 0;
+    viewStart = 0.0f;
+    viewWidth = times.back();
+
     logMessage(std::string("Loaded: ") + filepath);
 }
 
@@ -358,12 +336,15 @@ float getCurrentRMS(float playPos)
 
 float getTimeAtCursor(int mouseX)
 {
+    // normalize inside visible window
     float t = (float)(mouseX - sampleWindowOffsetX) / sampleWindowWidth;
 
+    // allow outside bounds safely
     if (t < 0.0f) t = 0.0f;
     if (t > 1.0f) t = 1.0f;
 
-    return t * times.back();
+    // convert to world time using zoom/pan
+    return viewStart + t * viewWidth;
 }
 
 std::string formatTime(float seconds)
@@ -381,23 +362,181 @@ std::string formatTime(float seconds)
     return ss.str();
 }
 
+std::string formatTimeMs(float seconds)
+{
+    int totalSeconds = (int)seconds;
+    int minutes = totalSeconds / 60;
+    int secs = totalSeconds % 60;
+
+    int millis = (int)((seconds - totalSeconds) * 1000);
+
+    std::stringstream ss;
+
+    // mm:ss.mmm
+    ss << minutes << ":";
+
+    if (secs < 10) ss << "0";
+    ss << secs << ".";
+
+    if (millis < 100) ss << "0";
+    if (millis < 10)  ss << "0";
+    ss << millis;
+
+    return ss.str();
+}
+
+float rmsPeakDisplay = minLUFS;
+
 void renderRmsBar(SDL_Renderer* renderer, float rmsDB)
 {
     if (rmsDB > maxLUFS) rmsDB = maxLUFS;
     if (rmsDB < minLUFS) rmsDB = minLUFS;
 
-    int barHeight = (rmsDB + lufsDelta) * lufsToPxScale;
+    int barX = 5;
+    int barWidth = 8;
+    int baseY = 500;
 
-    SDL_Rect fill = {
-        5,
-        500,
-        8,
-        -barHeight
+    int totalHeight = lufsDelta * lufsToPxScale;
+
+    // draw full bar range (-60 → 0)
+    for (int i = 0; i < totalHeight; i++)
+    {
+        // convert pixel → dB value
+        float db = minLUFS + (float)i / totalHeight * (maxLUFS - minLUFS);
+
+        // normalize for color (0..1)
+        float t = (db - minLUFS) / (maxLUFS - minLUFS);
+
+        Uint8 r, g, b;
+
+        if (t < 0.5f)
+        {
+            // green → yellow
+            float k = t / 0.5f;
+            r = (Uint8)(k * 255);
+            g = 255;
+            b = 0;
+        }
+        else
+        {
+            // yellow → red
+            float k = (t - 0.5f) / 0.5f;
+            r = 255;
+            g = (Uint8)((1.0f - k) * 255);
+            b = 0;
+        }
+
+        int y = baseY - i;
+
+        // ✅ only fill UP TO current RMS level
+        int currentHeight = (rmsDB + lufsDelta) * lufsToPxScale;
+
+        if (i <= currentHeight)
+        {
+            SDL_SetRenderDrawColor(renderer, r, g, b, 255);
+        }
+        else
+        {
+            // background (inactive part)
+            SDL_SetRenderDrawColor(renderer, 40, 40, 40, 255);
+        }
+
+        SDL_RenderDrawLine(renderer, barX, y, barX + barWidth, y);
+    }
+}
+
+
+
+int timeToX(float t)
+{
+    return (t - viewStart) / viewWidth * sampleWindowWidth + sampleWindowOffsetX;
+}
+
+void renderTimeline(SDL_Renderer* renderer, TTF_Font* font)
+{
+    int timelineY = 210;
+
+    // baseline
+    SDL_SetRenderDrawColor(renderer, 180, 180, 180, 255);
+    SDL_RenderDrawLine(renderer,
+        sampleWindowOffsetX,
+        timelineY,
+        sampleWindowOffsetX + sampleWindowWidth,
+        timelineY);
+
+    float totalTime = times.back();
+    // adaptive step (important for zoom)
+    float pixelsPerSecond = sampleWindowWidth / viewWidth;
+    // target spacing ~ 80–120 pixels between labels
+    float targetPx = 100.0f;
+    // desired seconds per tick
+    float rawStep = targetPx / pixelsPerSecond;
+    // choose nice rounded steps
+    float steps[] = {
+        1, 2, 5,
+        10, 15, 30,
+        60, 120, 300,
+        600, 1200, 1800
     };
 
-    SDL_SetRenderDrawColor(renderer, 0, 200, 255, 255);
-    SDL_RenderFillRect(renderer, &fill);
+    float step = steps[sizeof(steps)/sizeof(float) - 1];
+
+    for (float s : steps)
+    {
+        if (s >= rawStep)
+        {
+            step = s;
+            break;
+        }
+    }
+
+    int startSec = (int)(viewStart / step) * step;
+    for (float sec = startSec; sec <= viewStart + viewWidth; sec += step)
+    {
+        if (sec < 0) continue;
+        if (sec > totalTime) break;
+
+        int x = timeToX((float)sec);
+
+        if (x < sampleWindowOffsetX || x > sampleWindowOffsetX + sampleWindowWidth)
+            continue;
+
+        // major tick (every N secs)
+        SDL_SetRenderDrawColor(renderer, 200, 200, 200, 255);
+        SDL_RenderDrawLine(renderer, x, timelineY, x, timelineY + 10);
+
+        std::string label;
+        if (step >= 60)
+        {
+            // minutes only
+            int minutes = (int)(sec / 60);
+            label = std::to_string(minutes) + "m";
+        }
+        else
+        {
+            label = formatTime(sec);
+        }
+
+        drawText(renderer, font, label, x - 15, timelineY + 12);
+    }
+
+    // minor ticks (optional, denser)
+    float minorStep = step / 5.0f;
+    if (minorStep < 0.2f) minorStep = step / 2.0f;
+
+    for (float t = viewStart; t <= viewStart + viewWidth; t += minorStep)
+    {
+        int x = timeToX(t);
+
+        if (x < sampleWindowOffsetX || x > sampleWindowOffsetX + sampleWindowWidth)
+            continue;
+
+        SDL_SetRenderDrawColor(renderer, 120, 120, 120, 120);
+        SDL_RenderDrawLine(renderer, x, timelineY, x, timelineY + 5);
+    }
 }
+
+
 
 
 // =========================
@@ -414,12 +553,17 @@ int main(int argc, char** argv)
         filepath = "audio.wav";
     }
 
-    if (!loadFile(filepath)) {
+    if (!loadFile(filepath.c_str())) {
         std::cout << "Failed to load audio: " << filepath << "\n";
         return 0;
     }
 
     std::cout << "Loaded: " << filepath << "\n";
+
+    computeLUFS();
+
+    viewStart = 0.0f;
+    viewWidth = times.back();
 
     TTF_Init();
     TTF_Font* font_14 = TTF_OpenFont("C:/Windows/Fonts/consola.ttf", 14);
@@ -431,9 +575,6 @@ int main(int argc, char** argv)
 
     Button reloadBtn(900, 530, 80, 24, 14, "RELOAD");
     reloadBtn.onClick = reloadFile;
-
-    computeLUFS();
-    fillHistogram();
 
     SDL_Init(SDL_INIT_AUDIO | SDL_INIT_VIDEO);
 
@@ -463,8 +604,6 @@ int main(int argc, char** argv)
     bool running = true;
     Uint32 lastTime = SDL_GetTicks();
 
-    float playPos = 0.0f;
-
     while (running) {
         Uint32 frameStart = SDL_GetTicks();
         Uint32 now = frameStart;
@@ -479,13 +618,14 @@ int main(int argc, char** argv)
                 running = false;
 
             if (e.type == SDL_MOUSEBUTTONDOWN) {
-                if (e.button.y < 500) {
+                if (e.button.button == SDL_BUTTON_LEFT && e.button.y < 500) {
                     float t = (float)(e.button.x - sampleWindowOffsetX) / sampleWindowWidth;
 
                     if (t < 0.0f) t = 0.0f;
                     if (t > 1.0f) t = 1.0f;
 
-                    playPos = t * times.back();
+                    // ✅ correct mapping using view
+                    playPos = viewStart + t * viewWidth;
                     playIndex = playPos * sampleRate * channels;
                 }
             }
@@ -499,6 +639,52 @@ int main(int argc, char** argv)
                     increaseVolume();
                 if (e.key.keysym.sym == SDLK_DOWN)
                     decreaseVolume();
+            }
+
+            // ZOOM
+            if (e.type == SDL_MOUSEWHEEL)
+            {
+                const Uint8* keystate = SDL_GetKeyboardState(NULL);
+
+                int mouseX, mouseY;
+                SDL_GetMouseState(&mouseX, &mouseY);
+
+                float mouseT = (float)(mouseX - sampleWindowOffsetX) / sampleWindowWidth;
+                float worldTime = viewStart + mouseT * viewWidth;
+
+                // zoom
+                if (keystate[SDL_SCANCODE_LCTRL] || keystate[SDL_SCANCODE_RCTRL])
+                {
+                    float zoomFactor = (e.wheel.y > 0) ? 0.8f : 1.25f;
+
+                    float newWidth = viewWidth * zoomFactor;
+
+                    // clamp zoom limits
+                    float minWidth = 1.0f;                     // zoom in limit
+                    float maxWidth = times.back();            // zoom out limit
+
+                    if (newWidth < minWidth) newWidth = minWidth;
+                    if (newWidth > maxWidth) newWidth = maxWidth;
+
+                    // keep mouse position fixed in world space
+                    viewStart = worldTime - mouseT * newWidth;
+                    viewWidth = newWidth;
+                }
+                
+                // PAN                
+                if (keystate[SDL_SCANCODE_LSHIFT] || keystate[SDL_SCANCODE_RSHIFT])
+                {
+                    float panSpeed = viewWidth * 0.1f;
+
+                    viewStart -= e.wheel.y * panSpeed;
+                }
+                         
+                if (viewStart < 0.0f)
+                    viewStart = 0.0f;
+                if (viewStart + viewWidth > times.back())
+                    viewStart = times.back() - viewWidth;
+                if (viewStart < 0.0f)
+                    viewStart = 0.0f;
             }
 
             loadBtn.handleEvent(e);
@@ -524,15 +710,44 @@ int main(int argc, char** argv)
 
         int N = samples.size();
 
-        // draw 
+        // SAMPLE
+        float scale = sampleWindowHeight / 2.2f;
         int centerY = sampleWindowHeight / 2;
-        int samplesPerPixel = samples.size() / sampleWindowWidth;
+        int startFrame = viewStart * sampleRate;
+        int endFrame = (viewStart + viewWidth) * sampleRate;
+        int visibleFrames = endFrame - startFrame;
+        int samplesPerPixel = (visibleFrames * channels) / sampleWindowWidth;
+
+        SDL_SetRenderDrawColor(renderer, 0, 150, 0, 100);
+        for (float v = -1.0f; v <= 1.0f; v += 0.25f)
+        {
+            int y = centerY + (int)(v * scale);
+            int vInt = v * 100;
+            bool major = (vInt % 50 == 0);
+
+            if (major)
+                SDL_SetRenderDrawColor(renderer, 140, 140, 140, 100);
+            else
+                SDL_SetRenderDrawColor(renderer, 80, 80, 80, 100);
+
+            SDL_RenderDrawLine(renderer, sampleWindowOffsetX, y, sampleWindowOffsetX + sampleWindowWidth, y);
+
+            if (major)
+            {
+                std::stringstream ss;
+                ss << std::fixed << std::setprecision(1) << v;
+                drawText(
+                    renderer,
+                    font_12,
+                    ss.str(),
+                    20, y - 5
+                );
+            }
+        }
 
         SDL_SetRenderDrawColor(renderer, 0, 150, 255, 255);
-
         for (int x = 0; x < sampleWindowWidth; x++) {
-
-            int start = x * samplesPerPixel;
+            int start = startFrame * channels + x * samplesPerPixel;
             int end = start + samplesPerPixel;
 
             if (end > samples.size()) end = samples.size();
@@ -546,7 +761,6 @@ int main(int argc, char** argv)
                 if (v > maxVal) maxVal = v;
             }
 
-            float scale = sampleWindowHeight / 2.2f;
             int y1 = centerY + (int)(minVal * scale);
             int y2 = centerY + (int)(maxVal * scale);
 
@@ -573,26 +787,40 @@ int main(int argc, char** argv)
         }
 
         // LUFS LINE
-        for (int i = 1; i < lufs.size(); i++) {
-            // lufsMed = (lufsMed + lufs[i]) / 2;
-            int val1 = lufs[i-1];
-            int val2 = lufs[i];
+        for (int i = 1; i < lufs.size(); i++)
+        {
+            float t1 = times[i - 1];
+            float t2 = times[i];
 
-            if (val1 > maxLUFS ) val1 = maxLUFS;
+            // ✅ skip completely outside segments
+            if (t2 < viewStart) continue;
+            if (t1 > viewStart + viewWidth) break;
+
+            float val1 = lufs[i - 1];
+            float val2 = lufs[i];
+
+            if (val1 > maxLUFS) val1 = maxLUFS;
             if (val1 < minLUFS) val1 = minLUFS;
-            if (val2 > maxLUFS ) val2 = maxLUFS;
+            if (val2 > maxLUFS) val2 = maxLUFS;
             if (val2 < minLUFS) val2 = minLUFS;
 
-            int x1 = times[i-1]/times.back() * sampleWindowWidth + sampleWindowOffsetX;
+            int x1 = (t1 - viewStart) / viewWidth * sampleWindowWidth + sampleWindowOffsetX;
             int y1 = lufsGraphStartY - (val1 + lufsDelta) * lufsToPxScale;
 
-            int x2 = times[i]/times.back() * sampleWindowWidth + sampleWindowOffsetX;
+            int x2 = (t2 - viewStart) / viewWidth * sampleWindowWidth + sampleWindowOffsetX;
             int y2 = lufsGraphStartY - (val2 + lufsDelta) * lufsToPxScale;
 
-            SDL_SetRenderDrawColor(renderer, 255,80,80,255);
+            // ✅ optional: clamp to screen (extra safety)
+            if (x1 < sampleWindowOffsetX) x1 = sampleWindowOffsetX;
+            if (x1 > sampleWindowOffsetX + sampleWindowWidth) x1 = sampleWindowOffsetX + sampleWindowWidth;
+
+            if (x2 < sampleWindowOffsetX) x2 = sampleWindowOffsetX;
+            if (x2 > sampleWindowOffsetX + sampleWindowWidth) x2 = sampleWindowOffsetX + sampleWindowWidth;
+
+            SDL_SetRenderDrawColor(renderer, 255, 80, 80, 255);
             SDL_RenderDrawLine(renderer, x1, y1, x2, y2);
 
-            SDL_SetRenderDrawColor(renderer, 255,80,80,180);
+            SDL_SetRenderDrawColor(renderer, 255, 80, 80, 180);
             SDL_RenderDrawLine(renderer, x1+1, y1, x2, y2+1);
             SDL_RenderDrawLine(renderer, x1, y1+1, x2, y2+1);
         }
@@ -621,8 +849,8 @@ int main(int argc, char** argv)
         drawText(
             renderer,
             font_12,
-            "[RMS]",
-            10, 510
+            "RMS    LUFS",
+            5, 510
         );
 
         if (playing) {
@@ -630,16 +858,22 @@ int main(int argc, char** argv)
         }
 
         // --- PLAYHEAD ---
-        int px = playPos / times.back() * sampleWindowWidth + sampleWindowOffsetX;
+        int px = (playPos - viewStart) / viewWidth * sampleWindowWidth + sampleWindowOffsetX;
         SDL_SetRenderDrawColor(renderer, 255,255,0,255);
         SDL_RenderDrawLine(renderer, px, 0, px, 500);
+
+        // TIMELINE
+        int timelineY = 240;
+        SDL_SetRenderDrawColor(renderer, 255, 255, 0, 180);
+        SDL_RenderDrawLine(renderer, px, timelineY, px, timelineY + 12);
+        renderTimeline(renderer, font_12);
 
         // TIME
         float timeAtCursor = getTimeAtCursor(px);
         drawText(
             renderer, 
             font_14, 
-            "Time: " + formatTime(timeAtCursor), 
+            "Time: " + formatTimeMs(timeAtCursor), 
             200, 535);
 
         // GAIN
