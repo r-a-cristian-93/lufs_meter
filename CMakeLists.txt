@@ -17,7 +17,7 @@ target_link_libraries(app
 
 
 
-et(MSYS_BIN "C:/msys64/mingw64/bin")
+set(MSYS_BIN "C:/msys64/mingw64/bin")
 
 set(RUNTIME_DLLS
     SDL2.dll
