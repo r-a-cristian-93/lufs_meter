@@ -11,6 +11,7 @@
 #include <deque>
 #include <string>
 #include <format>
+#include <algorithm>
 #include "Button.h"
 #include "drawText.h"
 #include "Slider.h"
@@ -68,6 +69,19 @@ float fps = 0.0f;
 Uint32 lastFPSTime = 0;
 int frameCount = 0;
 const float targetFrameTime = 1.0f / 60.0f; // ~0.01667 sec
+
+// RENDERING
+SDL_Renderer *renderer = NULL;
+SDL_Texture *waveformTexture = NULL;
+const int MAX_TEXTURE_WIDTH = 2000; // safe
+
+struct WaveformTile
+{
+    SDL_Texture *tex;
+    int width;
+};
+
+std::vector<WaveformTile> waveformTiles;
 
 void logMessage(const std::string &msg)
 {
@@ -212,6 +226,106 @@ void computeLUFS()
     ebur128_destroy(&st);
 }
 
+struct WavePoint
+{
+    float minVal;
+    float maxVal;
+};
+
+std::vector<WavePoint> waveformCache;
+int waveformResolution = 5000;
+
+void computeWaveformCache(int width)
+{
+    if (!hasAudio)
+        return;
+
+    waveformCache.resize(width);
+
+    int totalFrames = samples.size() / channels;
+
+    for (int x = 0; x < width; x++)
+    {
+        int startFrame = (long long)x * totalFrames / width;
+        int endFrame = (long long)(x + 1) * totalFrames / width;
+
+        float minVal = 1.0f;
+        float maxVal = -1.0f;
+
+        for (int f = startFrame; f < endFrame; f++)
+        {
+            for (int c = 0; c < channels; c++)
+            {
+                float v = samples[f * channels + c];
+                if (v < minVal)
+                    minVal = v;
+                if (v > maxVal)
+                    maxVal = v;
+            }
+        }
+
+        waveformCache[x] = {minVal, maxVal};
+    }
+}
+
+void generateWaveformTexture(SDL_Renderer *renderer)
+{
+    float scale = sampleWindowHeight / 2.2f;
+    int centerY = sampleWindowHeight / 2;
+
+    int remaining = waveformResolution;
+    int offset = 0;
+
+    while (remaining > 0)
+    {
+        int chunkWidth = std::min(remaining, MAX_TEXTURE_WIDTH);
+
+        SDL_Texture *tex = SDL_CreateTexture(
+            renderer,
+            SDL_PIXELFORMAT_RGBA8888,
+            SDL_TEXTUREACCESS_TARGET,
+            chunkWidth,
+            sampleWindowHeight);
+
+        SDL_SetTextureBlendMode(tex, SDL_BLENDMODE_BLEND);
+        SDL_SetRenderTarget(renderer, tex);
+
+        SDL_SetRenderDrawColor(renderer, 0, 0, 0, 0);
+        SDL_RenderClear(renderer);
+
+        SDL_SetRenderDrawColor(renderer, 0, 150, 255, 255);
+        for (int x = 0; x < chunkWidth; x++)
+        {
+            int idx = offset + x;
+            if (idx >= waveformResolution)
+                break;
+
+            float minVal = waveformCache[idx].minVal;
+            float maxVal = waveformCache[idx].maxVal;
+
+            int y1 = centerY + (int)(minVal * scale);
+            int y2 = centerY + (int)(maxVal * scale);
+
+            y1 = std::clamp(y1, 0, sampleWindowHeight - 1);
+            y2 = std::clamp(y2, 0, sampleWindowHeight - 1);
+
+            if (y1 > y2)
+                std::swap(y1, y2);
+
+            SDL_RenderDrawLine(renderer, x, y1, x, y2);
+        }
+
+        SDL_SetRenderTarget(renderer, NULL);
+
+        waveformTiles.push_back({tex, chunkWidth});
+
+        remaining -= chunkWidth;
+        offset += chunkWidth;
+    }
+
+    SDL_SetRenderTarget(renderer, NULL);
+}
+
 void loadNewFile()
 {
     playing = false;
@@ -249,6 +363,15 @@ void loadNewFile()
         viewWidth = totalTime;
 
         logMessage(std::string("Loaded: ") + filepath);
+
+        float pixelsPerSecond = 200.0f;
+        int textureWidth = (int)(totalTime * pixelsPerSecond);
+        waveformResolution = textureWidth;
+
+        logMessage(std::to_string(textureWidth));
+
+        computeWaveformCache(textureWidth);
+        generateWaveformTexture(renderer);
     }
 }
 
@@ -275,6 +398,15 @@ void reloadFile()
     viewWidth = totalTime;
 
     logMessage(std::string("Loaded: ") + filepath);
+
+    float pixelsPerSecond = 200.0f;
+    int textureWidth = (int)(totalTime * pixelsPerSecond);
+    waveformResolution = textureWidth;
+
+    logMessage(std::to_string(textureWidth));
+
+    computeWaveformCache(textureWidth);
+    generateWaveformTexture(renderer);
 }
 
 float dbToGain(float db)
@@ -664,8 +796,17 @@ int main(int argc, char **argv)
         windowWidth, windowHeight,
         SDL_WINDOW_SHOWN);
 
-    SDL_Renderer *renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
+    renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
     SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
+
+    float pixelsPerSecond = 200.0f;
+    int textureWidth = (int)(totalTime * pixelsPerSecond);
+    waveformResolution = textureWidth;
+
+    logMessage(std::to_string(textureWidth));
+
+    computeWaveformCache(textureWidth);
+    generateWaveformTexture(renderer);
 
     bool running = true;
     Uint32 lastTime = SDL_GetTicks();
@@ -790,6 +931,7 @@ int main(int argc, char **argv)
         int visibleFrames = endFrame - startFrame;
         int samplesPerPixel = (visibleFrames * channels) / sampleWindowWidth;
 
+        // SAMPLE GRID
         SDL_SetRenderDrawColor(renderer, 0, 150, 0, 100);
         for (float v = -1.0f; v <= 1.0f; v += 0.25f)
         {
@@ -818,31 +960,75 @@ int main(int argc, char **argv)
 
         if (hasAudio)
         {
-            SDL_SetRenderDrawColor(renderer, 0, 150, 255, 255);
-            for (int x = 0; x < sampleWindowWidth; x++)
+            // SDL_SetRenderDrawColor(renderer, 0, 150, 255, 255);
+            // for (int x = 0; x < sampleWindowWidth; x++)
+            // {
+            //     int start = startFrame * channels + x * samplesPerPixel;
+            //     int end = start + samplesPerPixel;
+
+            //     if (end > samples.size())
+            //         end = samples.size();
+
+            //     float minVal = 1.0f;
+            //     float maxVal = -1.0f;
+
+            //     for (int i = start; i < end; i++)
+            //     {
+            //         float v = samples[i];
+            //         if (v < minVal)
+            //             minVal = v;
+            //         if (v > maxVal)
+            //             maxVal = v;
+            //     }
+
+            //     int y1 = centerY + (int)(minVal * scale);
+            //     int y2 = centerY + (int)(maxVal * scale);
+
+            //     SDL_RenderDrawLine(renderer, x + sampleWindowOffsetX, y1, x + sampleWindowOffsetX, y2);
+            // }
+
+            float pixelsPerSample = (float)waveformResolution / totalTime;
+            int pxOffset = sampleWindowOffsetX;
+            int currentOffset = 0;
+
+            for (auto &tile : waveformTiles)
             {
-                int start = startFrame * channels + x * samplesPerPixel;
-                int end = start + samplesPerPixel;
+                float tileStartTime = (float)currentOffset / waveformResolution * totalTime;
+                float tileEndTime = (float)(currentOffset + tile.width) / waveformResolution * totalTime;
 
-                if (end > samples.size())
-                    end = samples.size();
+                // ✅ compute overlap with view
+                float visibleStart = std::max(tileStartTime, viewStart);
+                float visibleEnd = std::min(tileEndTime, viewStart + viewWidth);
 
-                float minVal = 1.0f;
-                float maxVal = -1.0f;
-
-                for (int i = start; i < end; i++)
+                // skip if not visible
+                if (visibleEnd <= visibleStart)
                 {
-                    float v = samples[i];
-                    if (v < minVal)
-                        minVal = v;
-                    if (v > maxVal)
-                        maxVal = v;
+                    currentOffset += tile.width;
+                    continue;
                 }
 
-                int y1 = centerY + (int)(minVal * scale);
-                int y2 = centerY + (int)(maxVal * scale);
+                float tileDuration = tileEndTime - tileStartTime;
 
-                SDL_RenderDrawLine(renderer, x + sampleWindowOffsetX, y1, x + sampleWindowOffsetX, y2);
+                // ✅ source rect
+                float srcStart = (visibleStart - tileStartTime) / tileDuration;
+                float srcEnd = (visibleEnd - tileStartTime) / tileDuration;
+
+                int srcX = (int)(srcStart * tile.width);
+                int srcW = (int)((srcEnd - srcStart) * tile.width);
+
+                // ✅ destination rect
+                float normStart = (visibleStart - viewStart) / viewWidth;
+                float normEnd = (visibleEnd - viewStart) / viewWidth;
+
+                int dstX = sampleWindowOffsetX + (int)(normStart * sampleWindowWidth);
+                int dstW = (int)((normEnd - normStart) * sampleWindowWidth);
+
+                SDL_Rect src{srcX, 0, srcW, sampleWindowHeight};
+                SDL_Rect dst{dstX, 0, dstW, sampleWindowHeight};
+
+                SDL_RenderCopy(renderer, tile.tex, &src, &dst);
+
+                currentOffset += tile.width;
             }
         }
 
@@ -981,6 +1167,13 @@ int main(int argc, char **argv)
             font_14,
             "Output gain: " + std::to_string(int(gain * 100)) + "%",
             300, 555);
+
+        // ZOOM
+        drawText(
+            renderer,
+            font_14,
+            "Zoom: " + std::to_string((totalTime / viewWidth)),
+            500, 555);
 
         // LOG
         if (displayDebugWindow)
