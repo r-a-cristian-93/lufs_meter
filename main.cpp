@@ -326,6 +326,23 @@ void generateWaveformTexture(SDL_Renderer *renderer)
     SDL_SetRenderTarget(renderer, NULL);
 }
 
+void clearWaveformTexturesAndCache()
+{
+    for (auto &tile : waveformTiles)
+    {
+        if (tile.tex != nullptr)
+        {
+            SDL_DestroyTexture(tile.tex);
+            tile.tex = nullptr;
+        }
+    }
+
+    waveformTiles.clear();
+    waveformTiles.shrink_to_fit();
+    waveformCache.clear();
+    waveformCache.shrink_to_fit();
+}
+
 void loadNewFile()
 {
     playing = false;
@@ -364,12 +381,13 @@ void loadNewFile()
 
         logMessage(std::string("Loaded: ") + filepath);
 
-        float pixelsPerSecond = 200.0f;
+        float pixelsPerSecond = 300.0f;
         int textureWidth = (int)(totalTime * pixelsPerSecond);
         waveformResolution = textureWidth;
 
         logMessage(std::to_string(textureWidth));
 
+        clearWaveformTexturesAndCache();
         computeWaveformCache(textureWidth);
         generateWaveformTexture(renderer);
     }
@@ -405,6 +423,7 @@ void reloadFile()
 
     logMessage(std::to_string(textureWidth));
 
+    clearWaveformTexturesAndCache();
     computeWaveformCache(textureWidth);
     generateWaveformTexture(renderer);
 }
@@ -805,6 +824,7 @@ int main(int argc, char **argv)
 
     logMessage(std::to_string(textureWidth));
 
+    clearWaveformTexturesAndCache();
     computeWaveformCache(textureWidth);
     generateWaveformTexture(renderer);
 
@@ -869,7 +889,7 @@ int main(int argc, char **argv)
                     float newWidth = viewWidth * zoomFactor;
 
                     // clamp zoom limits
-                    float minWidth = 1.0f;      // zoom in limit
+                    float minWidth = 3.0f;      // zoom in limit
                     float maxWidth = totalTime; // zoom out limit
 
                     if (newWidth < minWidth)
@@ -893,7 +913,7 @@ int main(int argc, char **argv)
                 if (viewStart < 0.0f)
                     viewStart = 0.0f;
                 if (viewStart + viewWidth > totalTime)
-                    viewStart = totalTime;
+                    viewStart = totalTime - viewWidth;
                 if (viewStart < 0.0f)
                     viewStart = 0.0f;
             }
@@ -1169,10 +1189,11 @@ int main(int argc, char **argv)
             300, 555);
 
         // ZOOM
+        float zoomPercent = 100.0f - (viewWidth / totalTime) * 100.0f;
         drawText(
             renderer,
             font_14,
-            "Zoom: " + std::to_string((totalTime / viewWidth)),
+            "Zoom: " + std::to_string((int)zoomPercent) + "%",
             500, 555);
 
         // LOG
