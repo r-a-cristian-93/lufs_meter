@@ -10,6 +10,7 @@
 #include <windows.h>
 #include <deque>
 #include <string>
+#include <format>
 #include "Button.h"
 #include "drawText.h"
 #include "Slider.h"
@@ -49,6 +50,7 @@ int sampleWindowHeight = 200;
 std::vector<float> lufs;
 std::vector<float> lufsMomentary;
 std::vector<float> times;
+double integratedLufs;
 
 // use SAME mapping as LUFS graph
 float minLUFS = -60.0f;
@@ -195,6 +197,14 @@ void computeLUFS()
             ebur128_loudness_momentary(st, &momentaryVal);
             lufsMomentary.push_back(momentaryVal);
         }
+    }
+
+    double value = 0.0;
+
+    if (ebur128_loudness_global(st, &value) == EBUR128_SUCCESS)
+    {
+        integratedLufs = value;
+        logMessage("Integrated LUFS: " + std::to_string(value));
     }
 
     totalTime = times.empty() ? 1.0f : times.back();
@@ -638,7 +648,7 @@ int main(int argc, char **argv)
     Button reloadBtn(900, 530, 80, 24, 14, "RELOAD");
     reloadBtn.onClick = reloadFile;
 
-    Slider gainSlider(200, 580, 130, 4, gain);
+    Slider gainSlider(300, 580, 130, 4, gain);
     gainSlider.onChange = [](float v)
     {
         gain = v;
@@ -913,7 +923,7 @@ int main(int argc, char **argv)
         drawText(
             renderer,
             font_14,
-            "LUFS: " + std::to_string((int)roundf(currentLufs)),
+            "LUFS: " + std::to_string((int)roundf(currentLufs)) + " dB",
             20, 535);
 
         // RMS BAR
@@ -923,7 +933,7 @@ int main(int argc, char **argv)
         drawText(
             renderer,
             font_14,
-            "RMS: " + std::to_string((int)roundf(rms)),
+            "RMS: " + std::to_string((int)roundf(rms)) + " dB",
             20, 555);
 
         drawText(
@@ -931,6 +941,17 @@ int main(int argc, char **argv)
             font_12,
             "RMS    LUFS",
             5, 510);
+
+        // INTEGRATED LUFS
+
+        char integratedLufsText[64];
+        snprintf(integratedLufsText, sizeof(integratedLufsText), "Integrated LUFS: %.2f dB", integratedLufs);
+
+        drawText(
+            renderer,
+            font_14,
+            integratedLufsText,
+            20, 575);
 
         if (playing)
         {
@@ -952,14 +973,14 @@ int main(int argc, char **argv)
             renderer,
             font_14,
             "Time: " + formatTimeMs(timeAtCursor),
-            20, 575);
+            300, 535);
 
         // GAIN
         drawText(
             renderer,
             font_14,
             "Output gain: " + std::to_string(int(gain * 100)) + "%",
-            200, 555);
+            300, 555);
 
         // LOG
         if (displayDebugWindow)
